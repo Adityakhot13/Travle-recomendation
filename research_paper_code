@@ -1,0 +1,246 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, f1_score, classification_report
+import numpy as np
+
+# Load the dataset
+try:
+    df = pd.read_csv('/content/final.csv')
+except FileNotFoundError:
+    print("Error: 'MultipleFiles/final.csv' not found. Please ensure the file path is correct.")
+    exit()
+
+# --- Preprocessing ---
+df.drop_duplicates(inplace=True)
+# Drop the unnamed index column if it exists
+if df.columns[0] == 'Unnamed: 0':
+    df = df.drop(columns=df.columns[0])
+
+# Convert 'Airport with 50km Radius' and 'DSLR Allowed' to numerical (1/0)
+df['Airport with 50km Radius'] = df['Airport with 50km Radius'].map({'Yes': 1, 'No': 0})
+df['DSLR Allowed'] = df['DSLR Allowed'].map({'Yes': 1, 'No': 0})
+
+# Handle 'Establishment Year'
+# Convert 'Unknown' to NaN, then convert to numeric, then handle negative years
+df['Establishment Year'] = df['Establishment Year'].replace('Unknown', np.nan)
+df['Establishment Year'] = pd.to_numeric(df['Establishment Year'], errors='coerce')
+# Replace negative years with NaN (assuming they are data entry errors or historical anomalies not useful for numerical comparison)
+df.loc[df['Establishment Year'] < 0, 'Establishment Year'] = np.nan
+
+# Define features (X) and target (y) for model training
+# We'll use 'Type' as the target for classification
+X_model = df.drop(columns=['Name', 'Type']) # 'Name' is unique identifier, 'Type' is target
+y_model = df['Type']
+
+# --- Correction for ValueError: Handle rare classes in y_model ---
+# This step ensures that 'stratify' in train_test_split can work correctly by removing classes
+# that have only one member, as they cannot be split into both train and test sets.
+
+# Count occurrences of each class in the target variable
+class_counts = y_model.value_counts()
+
+# Identify classes (Types) that appear only once
+rare_classes = class_counts[class_counts == 1].index.tolist()
+
+if rare_classes:
+    print(f"Warning: The following 'Type' classes have only one member and will be removed for model training (due to stratification requirement): {rare_classes}")
+    # Create a boolean mask to keep only rows where 'Type' is NOT in the rare_classes list
+    rows_to_keep = ~y_model.isin(rare_classes)
+
+    # Apply the mask to both X_model and y_model
+    X_model = X_model[rows_to_keep].copy() # .copy() to avoid SettingWithCopyWarning
+    y_model = y_model[rows_to_keep].copy() # .copy() to avoid SettingWithCopyWarning
+
+    # Reset index after filtering to ensure clean indices
+    X_model.reset_index(drop=True, inplace=True)
+    y_model.reset_index(drop=True, inplace=True)
+else:
+    print("No rare classes (single members) found in 'Type' for model training.")
+
+# Identify numerical and categorical features for preprocessing
+numerical_features = ['Establishment Year', 'time needed to visit in hrs', 'Google review rating',
+                      'Entrance Fee in INR', 'Number of google review in lakhs']
+categorical_features = ['Zone', 'State', 'City', 'Weekly Off', 'Significance', 'Best Time to visit']
+binary_features = ['Airport with 50km Radius', 'DSLR Allowed'] # Already handled, but keep for completeness if not mapped
+
+# Ensure all numerical columns are numeric, coercing errors to NaN
+for col in numerical_features:
+    X_model[col] = pd.to_numeric(X_model[col], errors='coerce')
+
+# Create preprocessing pipelines for numerical and categorical features
+# Numerical: Impute missing values with mean, then scale
+numerical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='mean')),
+    ('scaler', StandardScaler())
+])
+
+# --- CORRECTION: Set sparse_output=False in OneHotEncoder ---
+# This forces the OneHotEncoder to return a dense array, which is compatible
+# with all KNN distance metrics.
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False)) # <--- ADDED THIS
+])
+
+# Combine transformers using ColumnTransformer
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numerical_transformer, numerical_features + binary_features), # Include binary features here
+        ('cat', categorical_transformer, categorical_features)
+    ],
+    remainder='passthrough' # Keep other columns if any, though none expected here
+)
+
+# Encode the target variable 'Type'
+label_encoder = LabelEncoder()
+y_model_encoded = label_encoder.fit_transform(y_model)
+
+# Split data into training and testing sets
+# This should now work correctly as single-member classes have been removed
+X_train, X_test, y_train, y_test = train_test_split(X_model, y_model_encoded, test_size=0.2, random_state=42, stratify=y_model_encoded)
+
+# --- Hybrid Model Implementation ---
+
+# Define different distance metrics for KNN
+knn_metrics = {
+    'Euclidean': 'euclidean',
+    'Manhattan': 'manhattan',
+    'Cosine': 'cosine',
+    'Chebyshev': 'chebyshev',
+    'Minkowski (p=3)': 'minkowski' # Minkowski with p=3
+}
+
+# Store results
+results = {}
+
+# K-Fold Cross-Validation setup
+n_splits = 5
+kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+print("--- Building and Evaluating Hybrid KNN+SVM Models ---")
+
+for metric_name, metric_func in knn_metrics.items():
+    print(f"\n--- KNN Metric: {metric_name} ---")
+
+    # Create a pipeline for KNN
+    knn_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('knn', KNeighborsClassifier(n_neighbors=5, metric=metric_func)) # Using n_neighbors=5 as a starting point
+    ])
+
+    # Evaluate KNN using cross-validation
+    knn_cv_scores = cross_val_score(knn_pipeline, X_train, y_train, cv=kf, scoring='accuracy')
+    print(f"KNN (Accuracy) Cross-Validation Scores: {knn_cv_scores}")
+    print(f"KNN (Accuracy) Mean CV Score: {np.mean(knn_cv_scores):.4f}")
+
+    # Train KNN on the full training data to get predictions for the test set
+    knn_pipeline.fit(X_train, y_train)
+    knn_test_predictions = knn_pipeline.predict(X_test)
+    print(f"KNN (Accuracy) on Test Set: {accuracy_score(y_test, knn_test_predictions):.4f}")
+    print(f"KNN (F1-Score) on Test Set: {f1_score(y_test, knn_test_predictions, average='weighted'):.4f}")
+    # print(f"KNN Classification Report:\n{classification_report(y_test, knn_test_predictions, target_names=label_encoder.classes_)}")
+
+    # --- SVM Component ---
+    # Create a pipeline for SVM
+    svm_pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('svm', SVC(kernel='rbf', random_state=42, probability=True)) # RBF kernel often performs well, enable probability for future use
+    ])
+
+    # Evaluate SVM using cross-validation
+    svm_cv_scores = cross_val_score(svm_pipeline, X_train, y_train, cv=kf, scoring='accuracy')
+    print(f"SVM (Accuracy) Cross-Validation Scores: {svm_cv_scores}")
+    print(f"SVM (Accuracy) Mean CV Score: {np.mean(svm_cv_scores):.4f}")
+
+    # Train SVM on the full training data
+    svm_pipeline.fit(X_train, y_train)
+    svm_test_predictions = svm_pipeline.predict(X_test)
+    print(f"SVM (Accuracy) on Test Set: {accuracy_score(y_test, svm_test_predictions):.4f}")
+    print(f"SVM (F1-Score) on Test Set: {f1_score(y_test, svm_test_predictions, average='weighted'):.4f}")
+    # print(f"SVM Classification Report:\n{classification_report(y_test, svm_test_predictions, target_names=label_encoder.classes_)}")
+
+    results[metric_name] = {
+        'KNN_Accuracy_CV_Mean': np.mean(knn_cv_scores),
+        'KNN_Accuracy_Test': accuracy_score(y_test, knn_test_predictions),
+        'KNN_F1_Test': f1_score(y_test, knn_test_predictions, average='weighted'),
+        'SVM_Accuracy_CV_Mean': np.mean(svm_cv_scores),
+        'SVM_Accuracy_Test': accuracy_score(y_test, svm_test_predictions),
+        'SVM_F1_Test': f1_score(y_test, svm_test_predictions, average='weighted')
+    }
+
+print("\n--- Summary of Model Performance ---")
+for metric, scores in results.items():
+    print(f"\nKNN Metric: {metric}")
+    print(f"  KNN Mean CV Accuracy: {scores['KNN_Accuracy_CV_Mean']:.4f}")
+    print(f"  KNN Test Accuracy: {scores['KNN_Accuracy_Test']:.4f}")
+    print(f"  KNN Test F1-Score: {scores['KNN_F1_Test']:.4f}")
+    print(f"  SVM Mean CV Accuracy: {scores['SVM_Accuracy_CV_Mean']:.4f}")
+    print(f"  SVM Test Accuracy: {scores['SVM_Accuracy_Test']:.4f}")
+    print(f"  SVM Test F1-Score: {scores['SVM_F1_Test']:.4f}")
+
+
+# --- Interactive Recommendation System ---
+
+print("\n--- Travel Destination Recommendation System ---")
+
+# Get unique values for user choices from the original df for full range of options
+# (even if some 'Type' categories were removed for model training, the original df
+# still contains all places for recommendation filtering)
+available_zones = df['Zone'].unique()
+available_significances = df['Significance'].unique()
+
+print("\nAvailable Zones:", ", ".join(available_zones))
+print("Available Significances:", ", ".join(available_significances))
+
+while True:
+    user_zone = input("\nEnter your preferred Zone (e.g., Northern, Southern, Eastern, Western): ").strip()
+    user_significance = input("Enter your preferred Significance (e.g., Historical, Religious, Nature, Recreational): ").strip()
+
+    # Validate user input
+    if user_zone not in available_zones:
+        print(f"Invalid Zone: '{user_zone}'. Please choose from the available zones.")
+        continue
+    if user_significance not in available_significances:
+        print(f"Invalid Significance: '{user_significance}'. Please choose from the available significances.")
+        continue
+
+    # Filter places based on user input from the original dataframe (df)
+    filtered_places = df[(df['Zone'] == user_zone) & (df['Significance'] == user_significance)]
+
+    if filtered_places.empty:
+        print(f"\nNo places found for Zone: '{user_zone}' and Significance: '{user_significance}'.")
+    else:
+        # --- Correction for potential non-numeric values in sorting columns ---
+        # Convert 'Google review rating' and 'Number of google review in lakhs' to numeric,
+        # coercing errors to NaN, then fill NaNs with 0 for sorting purposes.
+        # Using .loc to avoid SettingWithCopyWarning
+        filtered_places.loc[:, 'Google review rating'] = pd.to_numeric(filtered_places['Google review rating'], errors='coerce')
+        filtered_places.loc[:, 'Number of google review in lakhs'] = pd.to_numeric(filtered_places['Number of google review in lakhs'], errors='coerce')
+
+        # Fill NaNs in sorting columns with a value that won't disrupt sorting (e.g., 0)
+        # Using .loc to avoid SettingWithCopyWarning
+        filtered_places.loc[:, 'Google review rating'].fillna(0, inplace=True)
+        filtered_places.loc[:, 'Number of google review in lakhs'].fillna(0, inplace=True)
+
+        # Sort by Google review rating (descending) and then by Number of google review in lakhs (descending)
+        recommended_places = filtered_places.sort_values(
+            by=['Google review rating', 'Number of google review in lakhs'],
+            ascending=[False, False]
+        )
+
+        print(f"\n--- Top Recommendations for Zone: '{user_zone}' and Significance: '{user_significance}' ---")
+        # Display relevant columns for recommendation
+        display_cols = ['Name', 'City', 'State', 'Type', 'Google review rating', 'Number of google review in lakhs', 'Entrance Fee in INR', 'time needed to visit in hrs']
+        print(recommended_places[display_cols].head(10).to_string(index=False)) # Display top 10 without index
+
+    another_recommendation = input("\nDo you want another recommendation? (yes/no): ").strip().lower()
+    if another_recommendation != 'yes':
+        print("Thank you for using the recommendation system!")
+        break
+
